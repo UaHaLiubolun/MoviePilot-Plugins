@@ -135,28 +135,28 @@ class EmbyTagEnhance(_PluginBase):
                 "path": "/scan",
                 "endpoint": self.api_scan,
                 "methods": ["POST"],
-                "auth": "bear",
+                "auth": "apikey",
                 "summary": "手动触发扫描",
             },
             {
                 "path": "/progress",
                 "endpoint": self.api_progress,
                 "methods": ["GET"],
-                "auth": "bear",
+                "auth": "apikey",
                 "summary": "获取扫描进度",
             },
             {
                 "path": "/stats",
                 "endpoint": self.api_stats,
                 "methods": ["GET"],
-                "auth": "bear",
+                "auth": "apikey",
                 "summary": "获取统计数据",
             },
             {
                 "path": "/preview",
                 "endpoint": self.api_preview,
                 "methods": ["POST"],
-                "auth": "bear",
+                "auth": "apikey",
                 "summary": "预览影片标签",
             },
         ]
@@ -568,12 +568,13 @@ class EmbyTagEnhance(_PluginBase):
 
     def _get_emby_items(self, item_types: str = "Movie,Series") -> List[dict]:
         user_id = self._get_emby_admin_user()
+        fields = "ProviderIds,TagItems,Genres,Overview,ProductionYear,ProductionLocations"
         if user_id:
             result = self._emby_request(
                 "GET",
                 f"/Users/{user_id}/Items",
                 params={
-                    "Fields": "ProviderIds,TagItems,Genres,Overview,ProductionYear",
+                    "Fields": fields,
                     "IncludeItemTypes": item_types,
                     "Recursive": "true",
                     "Limit": 10000,
@@ -584,7 +585,7 @@ class EmbyTagEnhance(_PluginBase):
                 "GET",
                 "/Items",
                 params={
-                    "Fields": "ProviderIds,TagItems,Genres,Overview,ProductionYear",
+                    "Fields": fields,
                     "IncludeItemTypes": item_types,
                     "Recursive": "true",
                     "Limit": 10000,
@@ -649,26 +650,39 @@ class EmbyTagEnhance(_PluginBase):
 
     # ==================== Douban Tags ====================
 
-    def _get_douban_id_by_tmdb(self, tmdb_id: str, mtype: str = None) -> Optional[str]:
+    def _get_douban_id_by_name(self, name: str, mtype: str = None) -> Optional[str]:
         try:
-            from app.chain.media import MediaChain
-            from app.schemas.types import MediaType
-
-            media_type = None
-            if mtype == "Movie":
-                media_type = MediaType.MOVIE
-            elif mtype == "Series":
-                media_type = MediaType.TV
-
-            douban_info = MediaChain().get_doubaninfo_by_tmdbid(
-                tmdbid=int(tmdb_id),
-                mtype=media_type,
+            resp = requests.get(
+                "https://movie.douban.com/j/subject_suggest",
+                params={"q": name},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/120.0.0.0 Safari/537.36",
+                },
+                timeout=10,
             )
-            if douban_info and douban_info.get("id"):
-                return str(douban_info["id"])
+            if resp.status_code == 200:
+                results = resp.json()
+                target_type = "movie" if mtype == "Movie" else "tv"
+                for r in results:
+                    if r.get("type") == target_type and r.get("id"):
+                        return str(r["id"])
+                if results and results[0].get("id"):
+                    return str(results[0]["id"])
         except Exception as e:
-            logger.debug(f"TMDB ID {tmdb_id} 查找豆瓣ID失败: {e}")
+            logger.debug(f"豆瓣名称搜索失败 ({name}): {e}")
         return None
+
+    def _fetch_emby_native_tags(self, item: dict) -> List[dict]:
+        tags = []
+        genres = item.get("Genres") or []
+        for g in genres:
+            tags.append({"name": g, "count": 9999, "source": "emby_genre"})
+        locations = item.get("ProductionLocations") or []
+        for loc in locations:
+            tags.append({"name": loc, "count": 9999, "source": "emby_country"})
+        return tags
 
     def _fetch_douban_tags_web(self, douban_id: str) -> List[dict]:
         if not douban_id:
@@ -691,79 +705,46 @@ class EmbyTagEnhance(_PluginBase):
             logger.debug(f"获取豆瓣网页标签失败 {douban_id}: {e}")
         return []
 
-    def _fetch_tags_via_mp_builtin(self, tmdb_id: str, mtype: str = None) -> List[dict]:
-        tags = []
-        try:
-            from app.chain.media import MediaChain
-            from app.chain.douban import DoubanChain
-            from app.schemas.types import MediaType
-
-            media_type = None
-            if mtype == "Movie":
-                media_type = MediaType.MOVIE
-            elif mtype == "Series":
-                media_type = MediaType.TV
-
-            douban_info = MediaChain().get_doubaninfo_by_tmdbid(
-                tmdbid=int(tmdb_id),
-                mtype=media_type,
-            )
-            if douban_info:
-                genres = douban_info.get("genres", [])
-                for genre in genres:
-                    tags.append({"name": genre, "count": 9999, "source": "douban_genre"})
-
-                countries = douban_info.get("countries", [])
-                for country in countries:
-                    tags.append({"name": country, "count": 9999, "source": "douban_country"})
-
-            try:
-                from app.chain.tmdb import TmdbChain
-                tmdb_info = TmdbChain().tmdb_info(
-                    tmdbid=int(tmdb_id),
-                    mtype=media_type,
-                )
-                if tmdb_info:
-                    keywords = tmdb_info.get("keywords", {})
-                    if isinstance(keywords, dict):
-                        for kw in keywords.get("results", []):
-                            name = kw.get("name", "")
-                            if name:
-                                tags.append({"name": name, "count": 9999, "source": "tmdb_keyword"})
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.debug(f"MoviePilot内置API获取标签失败 (TMDB:{tmdb_id}): {e}")
+    def _fetch_tags_via_mp_builtin(self, item: dict) -> List[dict]:
+        tags = self._fetch_emby_native_tags(item)
+        item_name = item.get("Name", "")
+        item_type = item.get("Type", "")
+        douban_id = self._get_douban_id_by_name(item_name, item_type)
+        if douban_id:
+            time.sleep(self._request_interval)
+            web_tags = self._fetch_douban_tags_web(douban_id)
+            if web_tags:
+                tags.extend(web_tags)
         return tags
 
-    def _fetch_douban_tags(self, douban_id: str, tmdb_id: str = None, mtype: str = None) -> List[dict]:
+    def _fetch_douban_tags(self, item: dict) -> List[dict]:
+        item_name = item.get("Name", "")
+        item_type = item.get("Type", "")
         source = self._tag_source
 
         if source == "mp_builtin":
-            return self._fetch_tags_via_mp_builtin(tmdb_id or "", mtype)
+            return self._fetch_tags_via_mp_builtin(item)
 
         if source == "douban_web":
+            douban_id = self._get_douban_id_by_name(item_name, item_type)
+            if douban_id:
+                time.sleep(self._request_interval)
+                web_tags = self._fetch_douban_tags_web(douban_id)
+                if web_tags:
+                    return web_tags
             if not self._douban_cookie:
-                logger.warning("豆瓣用户标签模式需要配置Cookie，回退到内置API")
-                return self._fetch_tags_via_mp_builtin(tmdb_id or "", mtype)
-            return self._fetch_douban_tags_web(douban_id)
+                logger.warning("豆瓣用户标签模式需要配置Cookie且回退到内置API")
+            return self._fetch_tags_via_mp_builtin(item)
 
-        web_tags = []
-        if self._douban_cookie and douban_id:
-            web_tags = self._fetch_douban_tags_web(douban_id)
-
-        if web_tags:
-            return web_tags
-
-        if douban_id and not self._douban_cookie:
-            logger.debug("无豆瓣Cookie，尝试无Cookie访问用户标签...")
+        douban_id = self._get_douban_id_by_name(item_name, item_type)
+        if douban_id:
+            time.sleep(self._request_interval)
             web_tags = self._fetch_douban_tags_web(douban_id)
             if web_tags:
                 return web_tags
 
-        logger.debug("豆瓣用户标签获取失败，回退到MoviePilot内置API")
-        return self._fetch_tags_via_mp_builtin(tmdb_id or "", mtype)
+        logger.debug("豆瓣用户标签获取失败，回退到内置标签")
+        return self._fetch_tags_via_mp_builtin(item)
 
     # ==================== Tag Processing ====================
 
@@ -797,7 +778,7 @@ class EmbyTagEnhance(_PluginBase):
     def _filter_tags(self, raw_tags: List[dict]) -> List[str]:
         blacklist = self._get_blacklist()
         mapping = self._parse_tag_mapping()
-        existing_genres = set()
+        seen_genres = set()
         result = []
         for tag_item in raw_tags:
             name = tag_item.get("name", "").strip()
@@ -805,11 +786,12 @@ class EmbyTagEnhance(_PluginBase):
             source = tag_item.get("source", "")
             if not name:
                 continue
-            if source in ("douban_genre",) and name in existing_genres:
+            if source in ("emby_genre", "douban_genre") and name in seen_genres:
                 continue
-            if source in ("douban_genre",):
-                existing_genres.add(name)
-            if source != "douban_genre" and source != "douban_country" and source != "tmdb_keyword":
+            if source in ("emby_genre", "douban_genre"):
+                seen_genres.add(name)
+            if source not in ("emby_genre", "emby_country", "douban_genre",
+                              "douban_country", "tmdb_keyword"):
                 if count < self._min_tag_count:
                     continue
             if name in blacklist:
@@ -885,28 +867,14 @@ class EmbyTagEnhance(_PluginBase):
                     self._progress["skipped"] += 1
                     continue
 
-                provider_ids = item.get("ProviderIds", {})
-                tmdb_id = provider_ids.get("Tmdb") or provider_ids.get("TMDb")
-
-                if not tmdb_id:
-                    logger.debug(f"跳过(无TMDB ID): {item_name}")
+                existing_tag_items = item.get("TagItems") or []
+                existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
+                if any(n.startswith(self._tag_prefix) for n in existing_tag_names):
+                    logger.debug(f"跳过(已有插件标签): {item_name}")
                     self._progress["skipped"] += 1
                     continue
 
-                raw_tags = []
-                need_douban_id = self._tag_source in ("auto", "douban_web")
-                douban_id = None
-
-                if need_douban_id:
-                    douban_id = self._get_douban_id_by_tmdb(tmdb_id, item_type)
-                    if douban_id:
-                        time.sleep(self._request_interval)
-                        web_tags = self._fetch_douban_tags_web(douban_id)
-                        if web_tags:
-                            raw_tags = web_tags
-
-                if not raw_tags and self._tag_source != "douban_web":
-                    raw_tags = self._fetch_tags_via_mp_builtin(tmdb_id, item_type)
+                raw_tags = self._fetch_douban_tags(item)
 
                 if not raw_tags:
                     logger.debug(f"跳过(无标签数据): {item_name}")
@@ -1003,19 +971,8 @@ class EmbyTagEnhance(_PluginBase):
         if not item:
             return {"error": "未找到该媒体项"}
 
-        provider_ids = item.get("ProviderIds", {})
-        tmdb_id = provider_ids.get("Tmdb") or provider_ids.get("TMDb")
-        item_type = item.get("Type", "")
         item_name = item.get("Name", "")
-
-        if not tmdb_id:
-            return {"error": f"{item_name} 无TMDB ID"}
-
-        douban_id = self._get_douban_id_by_tmdb(tmdb_id, item_type)
-        if not douban_id:
-            return {"error": f"{item_name} 未找到豆瓣ID"}
-
-        raw_tags = self._fetch_douban_tags(douban_id, tmdb_id, item_type)
+        raw_tags = self._fetch_douban_tags(item)
         filtered_tags = self._filter_tags(raw_tags)
         existing_tag_items = item.get("TagItems") or []
         existing_tag_names = [t["Name"] for t in existing_tag_items if isinstance(t, dict)]
@@ -1023,8 +980,6 @@ class EmbyTagEnhance(_PluginBase):
 
         return {
             "name": item_name,
-            "tmdb_id": tmdb_id,
-            "douban_id": douban_id,
             "raw_tags": raw_tags,
             "filtered_tags": filtered_tags,
             "existing_tags": existing_tag_names,
