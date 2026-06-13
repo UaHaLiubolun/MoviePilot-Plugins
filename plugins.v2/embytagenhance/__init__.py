@@ -567,6 +567,21 @@ class EmbyTagEnhance(_PluginBase):
         )
         return result2 is not None
 
+    def _update_emby_item_with_data(self, item: dict) -> bool:
+        result = self._emby_request(
+            "POST",
+            f"/Items/{item.get('Id', '')}",
+            json_data=item,
+        )
+        if result is not None:
+            return True
+        result2 = self._emby_request(
+            "POST",
+            "/Items/Update",
+            json_data=item,
+        )
+        return result2 is not None
+
     # ==================== Douban Tags ====================
 
     def _get_douban_id_by_tmdb(self, tmdb_id: str, mtype: str = None) -> Optional[str]:
@@ -816,17 +831,23 @@ class EmbyTagEnhance(_PluginBase):
                     self._progress["skipped"] += 1
                     continue
 
-                douban_id = self._get_douban_id_by_tmdb(tmdb_id, item_type)
-                if not douban_id:
-                    logger.debug(f"跳过(未找到豆瓣ID): {item_name} (TMDB: {tmdb_id})")
-                    self._progress["skipped"] += 1
-                    continue
+                raw_tags = []
+                need_douban_id = self._tag_source in ("auto", "douban_web")
+                douban_id = None
 
-                time.sleep(self._request_interval)
+                if need_douban_id:
+                    douban_id = self._get_douban_id_by_tmdb(tmdb_id, item_type)
+                    if douban_id:
+                        time.sleep(self._request_interval)
+                        web_tags = self._fetch_douban_tags_web(douban_id)
+                        if web_tags:
+                            raw_tags = web_tags
 
-                raw_tags = self._fetch_douban_tags(douban_id, tmdb_id, item_type)
+                if not raw_tags and self._tag_source != "douban_web":
+                    raw_tags = self._fetch_tags_via_mp_builtin(tmdb_id, item_type)
+
                 if not raw_tags:
-                    logger.debug(f"跳过(无豆瓣标签): {item_name} (豆瓣: {douban_id})")
+                    logger.debug(f"跳过(无标签数据): {item_name}")
                     self._progress["skipped"] += 1
                     continue
 
@@ -846,8 +867,10 @@ class EmbyTagEnhance(_PluginBase):
 
                     if self._dry_run:
                         logger.info(f"[预览] {item_name}: 将添加标签 {filtered_tags}")
+                        total_tags_added += tags_added
                     else:
-                        success = self._update_emby_item_tags(item_id, merged_tags)
+                        item["Tags"] = merged_tags
+                        success = self._update_emby_item_with_data(item)
                         if success:
                             logger.info(f"已更新: {item_name} (+{tags_added} 标签)")
                             total_tags_added += tags_added
