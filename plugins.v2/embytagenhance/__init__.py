@@ -537,12 +537,16 @@ class EmbyTagEnhance(_PluginBase):
     def _get_emby_item(self, item_id: str) -> Optional[dict]:
         result = self._emby_request(
             "GET",
-            f"/Items/{item_id}",
+            "/Items",
             params={
                 "Fields": "ProviderIds,Tags,Genres",
+                "Ids": item_id,
             },
         )
-        return result
+        if not result:
+            return None
+        items = result.get("Items", [])
+        return items[0] if items else None
 
     def _update_emby_item_tags(self, item_id: str, tags: List[str]) -> bool:
         item = self._get_emby_item(item_id)
@@ -554,7 +558,14 @@ class EmbyTagEnhance(_PluginBase):
             f"/Items/{item_id}",
             json_data=item,
         )
-        return result is not None
+        if result is not None:
+            return True
+        result2 = self._emby_request(
+            "POST",
+            f"/Items/Update",
+            json_data=item,
+        )
+        return result2 is not None
 
     # ==================== Douban Tags ====================
 
