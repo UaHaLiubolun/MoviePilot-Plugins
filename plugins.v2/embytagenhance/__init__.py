@@ -43,6 +43,8 @@ class EmbyTagEnhance(_PluginBase):
     _running = False
     _lock = Lock()
 
+    _emby_user_id = ""
+
     def _resolve_media_server(self) -> Tuple[str, str]:
         try:
             from app.helper.mediaserver import MediaServerHelper
@@ -56,6 +58,24 @@ class EmbyTagEnhance(_PluginBase):
         except Exception as e:
             logger.debug(f"从MediaServerHelper获取Emby配置失败: {e}")
         return "", ""
+
+    def _get_emby_admin_user(self) -> str:
+        if self._emby_user_id:
+            return self._emby_user_id
+        try:
+            resp = requests.get(
+                f"{self._emby_url}/emby/Users",
+                params={"api_key": self._emby_api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            for u in resp.json():
+                if u.get("Policy", {}).get("IsAdministrator"):
+                    self._emby_user_id = u["Id"]
+                    return self._emby_user_id
+        except Exception as e:
+            logger.error(f"获取Emby管理员用户失败: {e}")
+        return ""
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -518,6 +538,9 @@ class EmbyTagEnhance(_PluginBase):
 
     # ==================== Emby API ====================
 
+    _HESTRIP = {"Chapters", "MediaSources", "MediaStreams", "People", "BackdropImageTags",
+                "ChapterInfo", "MediaAttachments"}
+
     def _emby_request(self, method: str, path: str, params: dict = None, json_data: dict = None) -> Optional[Any]:
         if not self._emby_url or not self._emby_api_key:
             logger.error("Emby地址或API Key未配置")
@@ -534,6 +557,8 @@ class EmbyTagEnhance(_PluginBase):
                 timeout=30,
             )
             resp.raise_for_status()
+            if resp.status_code == 204:
+                return {"_status": 204}
             if resp.text:
                 return resp.json()
             return {}
@@ -542,26 +567,50 @@ class EmbyTagEnhance(_PluginBase):
             return None
 
     def _get_emby_items(self, item_types: str = "Movie,Series") -> List[dict]:
-        result = self._emby_request(
-            "GET",
-            "/Items",
-            params={
-                "Fields": "ProviderIds,Tags,Genres,Overview,ProductionYear",
-                "IncludeItemTypes": item_types,
-                "Recursive": "true",
-                "Limit": 10000,
-            },
-        )
+        user_id = self._get_emby_admin_user()
+        if user_id:
+            result = self._emby_request(
+                "GET",
+                f"/Users/{user_id}/Items",
+                params={
+                    "Fields": "ProviderIds,TagItems,Genres,Overview,ProductionYear",
+                    "IncludeItemTypes": item_types,
+                    "Recursive": "true",
+                    "Limit": 10000,
+                },
+            )
+        else:
+            result = self._emby_request(
+                "GET",
+                "/Items",
+                params={
+                    "Fields": "ProviderIds,TagItems,Genres,Overview,ProductionYear",
+                    "IncludeItemTypes": item_types,
+                    "Recursive": "true",
+                    "Limit": 10000,
+                },
+            )
         if not result:
             return []
         return result.get("Items", [])
 
     def _get_emby_item(self, item_id: str) -> Optional[dict]:
+        user_id = self._get_emby_admin_user()
+        if user_id:
+            result = self._emby_request(
+                "GET",
+                f"/Users/{user_id}/Items/{item_id}",
+                params={
+                    "Fields": "ProviderIds,TagItems,Genres",
+                },
+            )
+            if result and "Id" in result:
+                return result
         result = self._emby_request(
             "GET",
             "/Items",
             params={
-                "Fields": "ProviderIds,Tags,Genres",
+                "Fields": "ProviderIds,TagItems,Genres",
                 "Ids": item_id,
             },
         )
@@ -570,11 +619,25 @@ class EmbyTagEnhance(_PluginBase):
         items = result.get("Items", [])
         return items[0] if items else None
 
-    def _update_emby_item_tags(self, item_id: str, tags: List[str]) -> bool:
+    def _update_emby_item_tags(self, item_id: str, new_tag_names: List[str]) -> bool:
         item = self._get_emby_item(item_id)
         if not item:
+            logger.error(f"获取Emby项目失败: {item_id}")
             return False
-        item["Tags"] = tags
+        existing_tag_items = item.get("TagItems") or []
+        existing_names = {t["Name"] for t in existing_tag_items}
+        merged = list(existing_tag_items)
+        for name in new_tag_names:
+            if name not in existing_names:
+                merged.append({"Name": name, "Id": 0})
+                existing_names.add(name)
+        item["TagItems"] = merged
+        return self._post_emby_item(item)
+
+    def _post_emby_item(self, item: dict) -> bool:
+        item_id = item.get("Id", "")
+        for key in self._HESTRIP:
+            item.pop(key, None)
         result = self._emby_request(
             "POST",
             f"/Items/{item_id}",
@@ -582,27 +645,7 @@ class EmbyTagEnhance(_PluginBase):
         )
         if result is not None:
             return True
-        result2 = self._emby_request(
-            "POST",
-            f"/Items/Update",
-            json_data=item,
-        )
-        return result2 is not None
-
-    def _update_emby_item_with_data(self, item: dict) -> bool:
-        result = self._emby_request(
-            "POST",
-            f"/Items/{item.get('Id', '')}",
-            json_data=item,
-        )
-        if result is not None:
-            return True
-        result2 = self._emby_request(
-            "POST",
-            "/Items/Update",
-            json_data=item,
-        )
-        return result2 is not None
+        return False
 
     # ==================== Douban Tags ====================
 
@@ -781,20 +824,17 @@ class EmbyTagEnhance(_PluginBase):
                 result.append(prefixed)
         return result
 
-    def _merge_tags(self, existing_tags: List[str], new_tags: List[str]) -> List[str]:
-        user_tags = [t for t in (existing_tags or []) if not t.startswith(self._tag_prefix)]
-        old_plugin_tags = [t for t in (existing_tags or []) if t.startswith(self._tag_prefix)]
-        merged = list(user_tags)
-        seen = set(user_tags)
+    def _merge_tags(self, existing_tag_items: list, new_tags: List[str]) -> List[str]:
+        existing_names = set()
+        for t in (existing_tag_items or []):
+            name = t.get("Name", "") if isinstance(t, dict) else str(t)
+            existing_names.add(name)
+        result = list(existing_names)
         for tag in new_tags:
-            tag_no_prefix = tag[len(self._tag_prefix):] if tag.startswith(self._tag_prefix) else tag
-            already = any(
-                t.endswith(tag_no_prefix) for t in seen if t.startswith(self._tag_prefix)
-            )
-            if not already and tag not in seen:
-                merged.append(tag)
-                seen.add(tag)
-        return merged
+            if tag not in existing_names:
+                result.append(tag)
+                existing_names.add(tag)
+        return result
 
     # ==================== Main Scan Logic ====================
 
@@ -878,21 +918,21 @@ class EmbyTagEnhance(_PluginBase):
                     self._progress["skipped"] += 1
                     continue
 
-                existing_tags = item.get("Tags", []) or []
-                merged_tags = self._merge_tags(existing_tags, filtered_tags)
-                tags_added = len(merged_tags) - len(existing_tags)
+                existing_tag_items = item.get("TagItems") or []
+                existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
+                tags_to_add = [t for t in filtered_tags if t not in existing_tag_names]
+                tags_added = len(tags_to_add)
 
                 if tags_added > 0:
-                    for tag in filtered_tags:
+                    for tag in tags_to_add:
                         tag_name = tag[len(self._tag_prefix):] if tag.startswith(self._tag_prefix) else tag
                         tag_counter[tag_name] = tag_counter.get(tag_name, 0) + 1
 
                     if self._dry_run:
-                        logger.info(f"[预览] {item_name}: 将添加标签 {filtered_tags}")
+                        logger.info(f"[预览] {item_name}: 将添加标签 {tags_to_add}")
                         total_tags_added += tags_added
                     else:
-                        item["Tags"] = merged_tags
-                        success = self._update_emby_item_with_data(item)
+                        success = self._update_emby_item_tags(item_id, tags_to_add)
                         if success:
                             logger.info(f"已更新: {item_name} (+{tags_added} 标签)")
                             total_tags_added += tags_added
@@ -977,8 +1017,9 @@ class EmbyTagEnhance(_PluginBase):
 
         raw_tags = self._fetch_douban_tags(douban_id, tmdb_id, item_type)
         filtered_tags = self._filter_tags(raw_tags)
-        existing_tags = item.get("Tags", []) or []
-        merged_tags = self._merge_tags(existing_tags, filtered_tags)
+        existing_tag_items = item.get("TagItems") or []
+        existing_tag_names = [t["Name"] for t in existing_tag_items if isinstance(t, dict)]
+        tags_to_add = [t for t in filtered_tags if t not in existing_tag_names]
 
         return {
             "name": item_name,
@@ -986,9 +1027,8 @@ class EmbyTagEnhance(_PluginBase):
             "douban_id": douban_id,
             "raw_tags": raw_tags,
             "filtered_tags": filtered_tags,
-            "existing_tags": existing_tags,
-            "merged_tags": merged_tags,
-            "tags_to_add": [t for t in merged_tags if t not in existing_tags],
+            "existing_tags": existing_tag_names,
+            "tags_to_add": tags_to_add,
         }
 
     # ==================== Event Handler ====================
