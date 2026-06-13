@@ -1,8 +1,13 @@
+import base64
+import hashlib
+import hmac
 import re
 import time
 from datetime import datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import parse
+from random import choice
 
 import requests
 
@@ -15,7 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 class EmbyTagEnhance(_PluginBase):
     plugin_name = "Emby标签增强"
-    plugin_desc = "通过豆瓣标签和TMDB关键词丰富Emby影视分类，无需Cookie也可使用"
+    plugin_desc = "通过豆瓣标签和评分丰富Emby影视分类，无需Cookie也可使用"
     plugin_icon = "tag.png"
     plugin_version = "1.0.0"
     plugin_author = "zhangxuanqing"
@@ -37,6 +42,7 @@ class EmbyTagEnhance(_PluginBase):
     _dry_run = False
     _request_interval = 5
     _tag_source = "auto"
+    _update_rating = True
 
     _progress = None
     _stats = None
@@ -100,6 +106,7 @@ class EmbyTagEnhance(_PluginBase):
         self._dry_run = bool(config.get("dry_run"))
         self._request_interval = int(config.get("request_interval") or 5)
         self._tag_source = config.get("tag_source") or "auto"
+        self._update_rating = bool(config.get("update_rating", True))
 
         self._progress = self.get_data("progress") or {
             "total": 0,
@@ -109,6 +116,7 @@ class EmbyTagEnhance(_PluginBase):
         }
         self._stats = self.get_data("stats") or {
             "total_tags_added": 0,
+            "total_ratings_updated": 0,
             "top_tags": [],
             "last_scan_time": "",
             "last_scan_duration": 0,
@@ -365,6 +373,19 @@ class EmbyTagEnhance(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "update_rating",
+                                            "label": "更新豆瓣评分到Emby",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -423,6 +444,7 @@ class EmbyTagEnhance(_PluginBase):
             "dry_run": False,
             "request_interval": 5,
             "tag_source": "auto",
+            "update_rating": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -474,7 +496,7 @@ class EmbyTagEnhance(_PluginBase):
                                     {
                                         "component": "VCardText",
                                         "props": {
-                                            "text": f"累计新增标签: {stats.get('total_tags_added', 0)} 个\n上次扫描: {stats.get('last_scan_time', '未运行')}\n耗时: {stats.get('last_scan_duration', 0)} 秒",
+                                            "text": f"累计新增标签: {stats.get('total_tags_added', 0)} 个\n更新评分: {stats.get('total_ratings_updated', 0)} 个\n上次扫描: {stats.get('last_scan_time', '未运行')}\n耗时: {stats.get('last_scan_duration', 0)} 秒",
                                         },
                                     },
                                 ],
@@ -527,7 +549,7 @@ class EmbyTagEnhance(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "text": f"已处理 {progress.get('processed', 0)}/{progress.get('total', 0)} 部 | 新增标签 {stats.get('total_tags_added', 0)} 个\n{tag_lines}",
+                    "text": f"已处理 {progress.get('processed', 0)}/{progress.get('total', 0)} 部 | 标签 +{stats.get('total_tags_added', 0)} | 评分 +{stats.get('total_ratings_updated', 0)}\n{tag_lines}",
                 },
             }
         ]
@@ -568,7 +590,7 @@ class EmbyTagEnhance(_PluginBase):
 
     def _get_emby_items(self, item_types: str = "Movie,Series") -> List[dict]:
         user_id = self._get_emby_admin_user()
-        fields = "ProviderIds,TagItems,Genres,Overview,ProductionYear,ProductionLocations"
+        fields = "ProviderIds,TagItems,Genres,Overview,ProductionYear,ProductionLocations,CommunityRating"
         if user_id:
             result = self._emby_request(
                 "GET",
@@ -635,6 +657,13 @@ class EmbyTagEnhance(_PluginBase):
         item["TagItems"] = merged
         return self._post_emby_item(item)
 
+    def _update_emby_rating(self, item_id: str, rating: float) -> bool:
+        item = self._get_emby_item(item_id)
+        if not item:
+            return False
+        item["CommunityRating"] = rating
+        return self._post_emby_item(item)
+
     def _post_emby_item(self, item: dict) -> bool:
         item_id = item.get("Id", "")
         for key in self._HESTRIP:
@@ -650,7 +679,52 @@ class EmbyTagEnhance(_PluginBase):
 
     # ==================== Douban Tags ====================
 
-    def _get_douban_id_by_name(self, name: str, mtype: str = None) -> Optional[str]:
+    _DOUBAN_API_KEY = "0dad551ec0f84ed02907ff5c42e8ec70"
+    _DOUBAN_API_SECRET = "bf7dddc7c9cfe6f7"
+    _DOUBAN_BASE_URL = "https://frodo.douban.com/api/v2"
+    _DOUBAN_USER_AGENTS = [
+        "api-client/1 com.douban.frodo/7.22.0.beta9(231) Android/23 product/Mate 40 vendor/HUAWEI model/Mate 40 brand/HUAWEI  rom/android  network/wifi  platform/AndroidPad",
+        "api-client/1 com.douban.frodo/7.18.0(230) Android/22 product/MI 9 vendor/Xiaomi model/MI 9 brand/Android  rom/miui6  network/wifi  platform/mobile nd/1",
+        "api-client/1 com.douban.frodo/7.1.0(205) Android/29 product/perseus vendor/Xiaomi model/Mi MIX 3  rom/miui6  network/wifi  platform/mobile nd/1",
+        "api-client/1 com.douban.frodo/7.3.0(207) Android/22 product/MI 9 vendor/Xiaomi model/MI 9 brand/Android  rom/miui6  network/wifi platform/mobile nd/1",
+    ]
+
+    def _douban_sign(self, url: str, ts: str, method: str = "GET") -> str:
+        url_path = parse.urlparse(url).path
+        raw = "&".join([method.upper(), parse.quote(url_path, safe=""), ts])
+        return base64.b64encode(
+            hmac.new(
+                self._DOUBAN_API_SECRET.encode(),
+                raw.encode(),
+                hashlib.sha1,
+            ).digest()
+        ).decode()
+
+    def _get_douban_detail(self, douban_id: str, mtype: str = "Movie") -> Optional[dict]:
+        try:
+            path = f"/movie/{douban_id}" if mtype == "Movie" else f"/tv/{douban_id}"
+            req_url = self._DOUBAN_BASE_URL + path
+            ts = datetime.strftime(datetime.now(), "%Y%m%d")
+            sig = self._douban_sign(req_url, ts)
+            resp = requests.get(
+                req_url,
+                params={
+                    "apiKey": self._DOUBAN_API_KEY,
+                    "os_rom": "android",
+                    "_ts": ts,
+                    "_sig": sig,
+                },
+                headers={"User-Agent": choice(self._DOUBAN_USER_AGENTS)},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.debug(f"豆瓣详情API返回 {resp.status_code}: {douban_id}")
+        except Exception as e:
+            logger.debug(f"获取豆瓣详情失败 ({douban_id}): {e}")
+        return None
+
+    def _get_douban_id_by_name(self, name: str, mtype: str = None, year: int = None) -> Optional[str]:
         try:
             resp = requests.get(
                 "https://movie.douban.com/j/subject_suggest",
@@ -664,12 +738,17 @@ class EmbyTagEnhance(_PluginBase):
             )
             if resp.status_code == 200:
                 results = resp.json()
+                if not results:
+                    return None
                 target_type = "movie" if mtype == "Movie" else "tv"
-                for r in results:
-                    if r.get("type") == target_type and r.get("id"):
-                        return str(r["id"])
-                if results and results[0].get("id"):
-                    return str(results[0]["id"])
+                type_matches = [r for r in results if r.get("type") == target_type]
+                candidates = type_matches if type_matches else results
+                if year:
+                    for r in candidates:
+                        if str(r.get("year", "")) == str(year) and r.get("id"):
+                            return str(r["id"])
+                if candidates and candidates[0].get("id"):
+                    return str(candidates[0]["id"])
         except Exception as e:
             logger.debug(f"豆瓣名称搜索失败 ({name}): {e}")
         return None
@@ -709,24 +788,48 @@ class EmbyTagEnhance(_PluginBase):
         tags = self._fetch_emby_native_tags(item)
         item_name = item.get("Name", "")
         item_type = item.get("Type", "")
-        douban_id = self._get_douban_id_by_name(item_name, item_type)
+        item_year = item.get("ProductionYear")
+        douban_id = self._get_douban_id_by_name(item_name, item_type, item_year)
         if douban_id:
+            time.sleep(self._request_interval)
+            detail = self._get_douban_detail(douban_id, item_type)
+            if detail:
+                for genre in detail.get("genres", []):
+                    tags.append({"name": genre, "count": 9999, "source": "douban_genre"})
             time.sleep(self._request_interval)
             web_tags = self._fetch_douban_tags_web(douban_id)
             if web_tags:
                 tags.extend(web_tags)
         return tags
 
+    def _get_douban_rating(self, item: dict) -> Optional[float]:
+        if not self._update_rating:
+            return None
+        item_name = item.get("Name", "")
+        item_type = item.get("Type", "")
+        item_year = item.get("ProductionYear")
+        douban_id = self._get_douban_id_by_name(item_name, item_type, item_year)
+        if not douban_id:
+            return None
+        time.sleep(self._request_interval)
+        detail = self._get_douban_detail(douban_id, item_type)
+        if detail:
+            rating = detail.get("rating", {})
+            if isinstance(rating, dict) and rating.get("value"):
+                return float(rating["value"])
+        return None
+
     def _fetch_douban_tags(self, item: dict) -> List[dict]:
         item_name = item.get("Name", "")
         item_type = item.get("Type", "")
+        item_year = item.get("ProductionYear")
         source = self._tag_source
 
         if source == "mp_builtin":
             return self._fetch_tags_via_mp_builtin(item)
 
         if source == "douban_web":
-            douban_id = self._get_douban_id_by_name(item_name, item_type)
+            douban_id = self._get_douban_id_by_name(item_name, item_type, item_year)
             if douban_id:
                 time.sleep(self._request_interval)
                 web_tags = self._fetch_douban_tags_web(douban_id)
@@ -736,7 +839,7 @@ class EmbyTagEnhance(_PluginBase):
                 logger.warning("豆瓣用户标签模式需要配置Cookie且回退到内置API")
             return self._fetch_tags_via_mp_builtin(item)
 
-        douban_id = self._get_douban_id_by_name(item_name, item_type)
+        douban_id = self._get_douban_id_by_name(item_name, item_type, item_year)
         if douban_id:
             time.sleep(self._request_interval)
             web_tags = self._fetch_douban_tags_web(douban_id)
@@ -852,6 +955,7 @@ class EmbyTagEnhance(_PluginBase):
 
             tag_counter = {}
             total_tags_added = 0
+            total_ratings_updated = 0
             new_processed_ids = set(processed_ids)
 
             for idx, item in enumerate(items):
@@ -869,48 +973,62 @@ class EmbyTagEnhance(_PluginBase):
 
                 existing_tag_items = item.get("TagItems") or []
                 existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
-                if any(n.startswith(self._tag_prefix) for n in existing_tag_names):
-                    logger.debug(f"跳过(已有插件标签): {item_name}")
+                has_plugin_tags = any(n.startswith(self._tag_prefix) for n in existing_tag_names)
+
+                existing_rating = item.get("CommunityRating")
+
+                raw_tags = self._fetch_douban_tags(item) if not has_plugin_tags else []
+                douban_rating = self._get_douban_rating(item) if self._update_rating and not existing_rating else None
+
+                if not raw_tags and douban_rating is None:
+                    logger.debug(f"跳过(无标签和评分数据): {item_name}")
                     self._progress["skipped"] += 1
                     continue
 
-                raw_tags = self._fetch_douban_tags(item)
+                action_done = False
 
-                if not raw_tags:
-                    logger.debug(f"跳过(无标签数据): {item_name}")
-                    self._progress["skipped"] += 1
-                    continue
+                if raw_tags:
+                    filtered_tags = self._filter_tags(raw_tags)
+                    if filtered_tags:
+                        existing_tag_items = item.get("TagItems") or []
+                        existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
+                        tags_to_add = [t for t in filtered_tags if t not in existing_tag_names]
 
-                filtered_tags = self._filter_tags(raw_tags)
-                if not filtered_tags:
-                    self._progress["skipped"] += 1
-                    continue
+                        if tags_to_add:
+                            for tag in tags_to_add:
+                                tag_name = tag[len(self._tag_prefix):] if tag.startswith(self._tag_prefix) else tag
+                                tag_counter[tag_name] = tag_counter.get(tag_name, 0) + 1
 
-                existing_tag_items = item.get("TagItems") or []
-                existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
-                tags_to_add = [t for t in filtered_tags if t not in existing_tag_names]
-                tags_added = len(tags_to_add)
+                            if self._dry_run:
+                                logger.info(f"[预览] {item_name}: 将添加标签 {tags_to_add}")
+                                total_tags_added += len(tags_to_add)
+                            else:
+                                success = self._update_emby_item_tags(item_id, tags_to_add)
+                                if success:
+                                    logger.info(f"已更新标签: {item_name} (+{len(tags_to_add)} 标签)")
+                                    total_tags_added += len(tags_to_add)
+                                    action_done = True
+                                else:
+                                    logger.error(f"标签写入失败: {item_name}")
 
-                if tags_added > 0:
-                    for tag in tags_to_add:
-                        tag_name = tag[len(self._tag_prefix):] if tag.startswith(self._tag_prefix) else tag
-                        tag_counter[tag_name] = tag_counter.get(tag_name, 0) + 1
-
+                if douban_rating is not None:
                     if self._dry_run:
-                        logger.info(f"[预览] {item_name}: 将添加标签 {tags_to_add}")
-                        total_tags_added += tags_added
+                        logger.info(f"[预览] {item_name}: 将更新评分 {douban_rating}")
+                        total_ratings_updated += 1
                     else:
-                        success = self._update_emby_item_tags(item_id, tags_to_add)
+                        success = self._update_emby_rating(item_id, douban_rating)
                         if success:
-                            logger.info(f"已更新: {item_name} (+{tags_added} 标签)")
-                            total_tags_added += tags_added
+                            logger.info(f"已更新评分: {item_name} → {douban_rating}")
+                            total_ratings_updated += 1
+                            action_done = True
                         else:
-                            logger.error(f"写入失败: {item_name}")
-                            self._progress["failed"] += 1
-                            continue
+                            logger.error(f"评分写入失败: {item_name}")
 
-                self._progress["processed"] += 1
-                new_processed_ids.add(item_id)
+                if action_done or (self._dry_run and (raw_tags or douban_rating is not None)):
+                    self._progress["processed"] += 1
+                    new_processed_ids.add(item_id)
+                else:
+                    self._progress["skipped"] += 1
 
                 if (idx + 1) % 20 == 0:
                     self.save_data("progress", self._progress)
@@ -920,6 +1038,7 @@ class EmbyTagEnhance(_PluginBase):
             sorted_tags = sorted(tag_counter.items(), key=lambda x: x[1], reverse=True)
             self._stats = {
                 "total_tags_added": total_tags_added,
+                "total_ratings_updated": total_ratings_updated,
                 "top_tags": [{"name": k, "count": v} for k, v in sorted_tags[:20]],
                 "last_scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_scan_duration": duration,
@@ -935,6 +1054,7 @@ class EmbyTagEnhance(_PluginBase):
                 f"跳过 {self._progress['skipped']} 部, "
                 f"失败 {self._progress['failed']} 部, "
                 f"新增标签 {total_tags_added} 个, "
+                f"更新评分 {total_ratings_updated} 个, "
                 f"耗时 {duration}s"
             )
 
