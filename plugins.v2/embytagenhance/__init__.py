@@ -43,11 +43,33 @@ class EmbyTagEnhance(_PluginBase):
     _running = False
     _lock = Lock()
 
+    def _resolve_media_server(self) -> Tuple[str, str]:
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+            services = MediaServerHelper().get_services(type_filter="emby")
+            for svc in services:
+                if svc.instance and svc.config:
+                    host = svc.config.get("host", "").rstrip("/")
+                    apikey = svc.config.get("apikey", "")
+                    if host and apikey:
+                        return host, apikey
+        except Exception as e:
+            logger.debug(f"从MediaServerHelper获取Emby配置失败: {e}")
+        return "", ""
+
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._emby_url = (config.get("emby_url") or "").rstrip("/")
         self._emby_api_key = config.get("emby_api_key") or ""
+        if not self._emby_url or not self._emby_api_key:
+            auto_url, auto_key = self._resolve_media_server()
+            if auto_url and auto_key:
+                if not self._emby_url:
+                    self._emby_url = auto_url
+                if not self._emby_api_key:
+                    self._emby_api_key = auto_key
+                logger.info(f"Emby标签增强: 自动检测到Emby配置 {self._emby_url}")
         self._douban_cookie = config.get("douban_cookie") or ""
         self._tag_prefix = config.get("tag_prefix") or "db:"
         self._scan_cron = config.get("scan_cron") or "0 3 * * *"
@@ -170,7 +192,7 @@ class EmbyTagEnhance(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "emby_url",
-                                            "label": "Emby地址",
+                                            "label": "Emby地址（留空自动读取）",
                                             "placeholder": "http://192.168.1.1:8096",
                                         },
                                     }
@@ -184,7 +206,7 @@ class EmbyTagEnhance(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "emby_api_key",
-                                            "label": "Emby API Key",
+                                            "label": "Emby API Key（留空自动读取）",
                                             "type": "password",
                                         },
                                     }
