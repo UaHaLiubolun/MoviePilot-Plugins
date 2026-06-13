@@ -1,0 +1,15 @@
+{
+  "EmbyTagEnhance": {
+    "name": "Emby标签增强",
+    "description": "通过豆瓣标签和TMDB关键词丰富Emby影视分类，无需Cookie也可使用",
+    "labels": "标签,豆瓣,Emby",
+    "version": "1.0.0",
+    "icon": "tag.png",
+    "author": "zhangxuanqing",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "1.0.0": "初始版本，支持豆瓣用户标签和MoviePilot内置API双模式"
+    }
+  }
+}
