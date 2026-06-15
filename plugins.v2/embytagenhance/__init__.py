@@ -978,7 +978,7 @@ class EmbyTagEnhance(_PluginBase):
                 existing_rating = item.get("CommunityRating")
 
                 raw_tags = self._fetch_douban_tags(item) if not has_plugin_tags else []
-                douban_rating = self._get_douban_rating(item) if self._update_rating and not existing_rating else None
+                douban_rating = self._get_douban_rating(item) if self._update_rating else None
 
                 if not raw_tags and douban_rating is None:
                     logger.debug(f"跳过(无标签和评分数据): {item_name}")
