@@ -943,9 +943,9 @@ class EmbyTagEnhance(_PluginBase):
                     self._progress["skipped"] += 1
                     continue
 
-                raw_tags, douban_rating = self._fetch_item_info(item) if need_tags else ([], None)
-                if need_rating and not need_tags:
-                    _, douban_rating = self._fetch_item_info(item)
+                raw_tags, douban_rating = [], None
+                if need_tags or need_rating:
+                    raw_tags, douban_rating = self._fetch_item_info(item)
 
                 if not raw_tags and douban_rating is None:
                     logger.debug(f"跳过(无标签和评分数据): {item_name}")
@@ -953,7 +953,7 @@ class EmbyTagEnhance(_PluginBase):
                     continue
 
                 tags_to_add = []
-                if raw_tags:
+                if raw_tags and need_tags:
                     filtered_tags = self._filter_tags(raw_tags)
                     existing_tag_items = item.get("TagItems") or []
                     existing_tag_names = {t["Name"] for t in existing_tag_items if isinstance(t, dict)}
