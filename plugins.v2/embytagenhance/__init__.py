@@ -729,34 +729,48 @@ class EmbyTagEnhance(_PluginBase):
         if cache_key in self._douban_id_cache:
             return self._douban_id_cache[cache_key]
         try:
+            search_path = "/search/movie" if mtype == "Movie" else "/search/tv"
+            req_url = self._DOUBAN_BASE_URL + search_path
+            ts = datetime.strftime(datetime.now(), "%Y%m%d")
+            sig = self._douban_sign(req_url, ts)
             resp = requests.get(
-                "https://movie.douban.com/j/subject_suggest",
-                params={"q": name},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                  "Chrome/120.0.0.0 Safari/537.36",
+                req_url,
+                params={
+                    "apiKey": self._DOUBAN_API_KEY,
+                    "os_rom": "android",
+                    "_ts": ts,
+                    "_sig": sig,
+                    "q": name,
+                    "count": 5,
                 },
-                timeout=10,
+                headers={"User-Agent": choice(self._DOUBAN_USER_AGENTS)},
+                timeout=15,
             )
             if resp.status_code == 200:
-                results = resp.json()
+                results = resp.json().get("items", [])
                 if not results:
                     self._douban_id_cache[cache_key] = None
                     return None
-                target_type = "movie" if mtype == "Movie" else "tv"
-                type_matches = [r for r in results if r.get("type") == target_type]
-                candidates = type_matches if type_matches else results
+                candidates = []
+                for r in results:
+                    target = r.get("target", r)
+                    candidates.append({
+                        "id": str(target.get("id", "")),
+                        "title": target.get("title", ""),
+                        "year": target.get("year", ""),
+                        "rating": target.get("rating", {}),
+                    })
                 result_id = None
                 if year:
-                    for r in candidates:
-                        if str(r.get("year", "")) == str(year) and r.get("id"):
-                            result_id = str(r["id"])
+                    for c in candidates:
+                        if str(c.get("year", "")) == str(year) and c.get("id"):
+                            result_id = c["id"]
                             break
                 if not result_id and candidates and candidates[0].get("id"):
-                    result_id = str(candidates[0]["id"])
+                    result_id = candidates[0]["id"]
                 self._douban_id_cache[cache_key] = result_id
                 return result_id
+            logger.debug(f"豆瓣搜索API返回 {resp.status_code}: {name}")
         except Exception as e:
             logger.debug(f"豆瓣名称搜索失败 ({name}): {e}")
         return None
@@ -805,15 +819,15 @@ class EmbyTagEnhance(_PluginBase):
 
         time.sleep(self._request_interval)
 
-        detail = self._get_douban_detail(douban_id, item_type)
-        if detail:
-            if self._update_rating:
+        if self._update_rating:
+            detail = self._get_douban_detail(douban_id, item_type)
+            if detail:
                 rating_info = detail.get("rating", {})
                 if isinstance(rating_info, dict) and rating_info.get("value"):
                     douban_rating = float(rating_info["value"])
-            if source != "douban_web":
-                for genre in detail.get("genres", []):
-                    tags.append({"name": genre, "count": 9999, "source": "douban_genre"})
+                if source != "douban_web":
+                    for genre in detail.get("genres", []):
+                        tags.append({"name": genre, "count": 9999, "source": "douban_genre"})
 
         if source != "mp_builtin":
             time.sleep(self._request_interval)
